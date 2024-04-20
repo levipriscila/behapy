@@ -38,14 +38,15 @@ def get_preprocessed_fibre_path(root, sub, ses, task, run, label, ext):
                                   label=label, ext=ext)
 
 
-def list_recordings(base, subject='*', session='*', task='*', run='*', label='*', ext='npy'):
+def list_recordings(base, subject='*', session='*', task='*', run='*',
+                    label='*', channel='*', ext='npy'):
     Recording = namedtuple("Recording", ["subject", "session", "task", "run", "label", "channel", "file_path"])
 
     # Set the pattern for the data files
     base = Path(base)
     pattern = (f'sub-{subject}/ses-{session}/fp/'
                f'sub-{subject}_ses-{session}_'
-               f'task-{task}_run-{run}_label-{label}_channel-*.{ext}')
+               f'task-{task}_run-{run}_label-{label}_channel-{channel}.{ext}')
     # Search for files that match the pattern
     data_files = list(base.glob(str(pattern)))
     # Regex pattern to extract variables from the file names
@@ -63,9 +64,10 @@ def list_recordings(base, subject='*', session='*', task='*', run='*', label='*'
     return extracted_data
 
 
-def list_raw(root, subject='*', session='*', task='*', run='*', label='*'):
+def list_raw(root, subject='*', session='*', task='*', run='*', label='*',
+             channel='*'):
     return list_recordings(Path(root) / 'rawdata', subject,
-                           session, task, run, label, 'npy')
+                           session, task, run, label, channel, 'npy')
 
 
 def list_preprocessed(root, subject='*', session='*', task='*', run='*',

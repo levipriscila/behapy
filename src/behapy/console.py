@@ -112,8 +112,8 @@ def preprocess_dash(bidsroot):
 
     def get_recording(index):
         r = signals.iloc[index]
-        signal = fp.load_signal(bidsroot, r.subject, r.session, r.task, r.run,
-                                r.label, 'iso')
+        signal = fp.load_signals(bidsroot, r.subject, r.session, r.task, r.run,
+                                 r.label, 'iso')
         return signal
 
     dash = PreprocessDashboard(signals, get_recording, bidsroot)
