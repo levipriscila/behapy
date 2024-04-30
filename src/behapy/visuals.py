@@ -1,5 +1,5 @@
 import logging
-from functools import partial
+from functools import partial, reduce
 from intervaltree import Interval
 import json
 from . import fp
@@ -136,24 +136,16 @@ class PreprocessDashboard(param.Parameterized):
     @param.depends("selected_index", "interval_update", watch=True)
     def update_regressions(self):
         rej = fp.reject(self.recording, self.intervals, fill=True)
-        ch = self.recording.attrs['channel']
+        if 'channels' not in self.recording.attrs:
+            ch = [self.recording.attrs['channel']]
+        else:
+            ch = self.recording.attrs['channels']
         config = load_preprocess_config(self.bidsroot)
         # We were doing a robust regression, but the fit isn't good enough.
         # Let's just detrend and divide by the smoothed signal instead.
         dff = fp.detrend(rej[ch], cutoff=config['detrend_cutoff'])
         dff = dff / fp.smooth(rej[ch])
-        dff.name = 'dff'
-        # dff = fp.series_like(self.recording, name='dff')
-        # dff.loc[rej.index] = fp.detrend(rej[ch])
-        # dff = dff / fp.smooth(rej[ch])
-        # OLD REGRESSION CODE
-        # fit = fp.fit(rej)
-        # regression = fp.series_like(rej, name='regression')
-        # regression[:] = fit.fittedvalues
-        # self.regression = regression
-        # dff = fp.series_like(self.recording, name='dff')
-        # dff.loc[rej.index] = (rej[ch] - regression) / regression
-        # dff = dff / dff.std()
+        # dff.name = 'dff'
         self.dff = dff
         self.regression_update += 1
 
@@ -163,22 +155,38 @@ class PreprocessDashboard(param.Parameterized):
             return
         regression = self.regression
         tools = ['xbox_select']
-        isoch = self.recording.attrs['iso_channel']
-        ch = self.recording.attrs['channel']
+        if 'channels' not in self.recording.attrs:
+            channels = [self.recording.attrs['channel']]
+            ach = self.recording.attrs['iso_channel']
+        else:
+            channels = self.recording.attrs['channels']
+            ach = self.recording.attrs['artifact_channel']
         iso_shade = datashade(
-            signal_curve(self.recording[isoch], y_dim='F'),
+            signal_curve(self.recording[ach], y_dim='F'),
             aggregator=ds.count(), cmap='blue')
-        sig_shade = datashade(
-            signal_curve(self.recording[ch], y_dim='F'),
-            aggregator=ds.count(), cmap='red').opts(tools=tools)
-        dff_shade = datashade(
-            signal_curve(self.dff, y_dim='dF/F'),
-            aggregator=ds.count(), cmap='green')
+        sig_shades = []
+        dff_shades = []
+        cmaps = ['red', 'green', 'purple']
+        for ch, cmap in zip(channels, cmaps):
+            sig_shade = datashade(
+                signal_curve(self.recording[ch], y_dim='F'),
+                aggregator=ds.count(), cmap=cmap).opts(tools=tools)
+            dff_shade = datashade(
+                signal_curve(self.dff[ch], y_dim=ch),
+                aggregator=ds.count(), cmap=cmap)
+            sig_shades.append(sig_shade)
+            dff_shades.append(dff_shade)
         overlay = interval_overlay_map(iso_shade, self.intervals,
                                        self.update_intervals)
         # plot = (rej_shade.opts(xaxis=None) +
-        plot = ((iso_shade * sig_shade * overlay).opts(xaxis=None) +
-                dff_shade)
+        # overlay = (iso_shade * sig_shade * overlay)
+        # raw_plot = hv.Overlay([iso_shade] + sig_shades) * overlay
+        raw_plot = reduce(lambda a, b: a * b,
+                          [iso_shade, overlay] + sig_shades)
+        raw_plot = raw_plot.opts(xaxis=None)
+        # plot = ((iso_shade * sig_shade * overlay).opts(xaxis=None) +
+        #         dff_shade)
+        plot = raw_plot + hv.Layout(dff_shades)
         plot = plot.opts(
             opts.RGB(responsive=True, min_width=600, min_height=300,
                      tools=tools))
@@ -197,5 +205,5 @@ class PreprocessDashboard(param.Parameterized):
                 sizing_mode='stretch_both'
             ),
             styles=dict(background='WhiteSmoke'),
-             sizing_mode='stretch_both'
+            sizing_mode='stretch_both'
         )

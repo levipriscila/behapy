@@ -23,6 +23,8 @@ Event = namedtuple('Event', ['name', 'fields', 'codes', 'onset', 'offset'])
 def series_like(df, name, default=0.):
     series = pd.Series(default, index=df.index, name=name)
     series.attrs = df.attrs.copy()
+    _ = series.attrs.pop('artifact_channel', None)
+    _ = series.attrs.pop('channels', None)
     _ = series.attrs.pop('iso_channel', None)
     _ = series.attrs.pop('channel', None)
     return series
@@ -39,13 +41,101 @@ def load_channel(root, subject, session, task, run, label, channel):
     return data, meta
 
 
-def load_signal(root, subject, session, task, run, label, iso_channel='iso'):
-    """Load a raw signal, including the isosbestic channel if present.
+def load_signals(root, subject, session, task, run, label,
+                 artifact_channel=None, exclude_artifact_channel=True):
+    """Load all raw signals for a given site.
     """
     root = Path(root).absolute()
     recordings = pd.DataFrame(
         list_raw(root, subject=subject, session=session, task=task,
                  run=run, label=label))
+    subjects = recordings.loc[:, 'subject'].unique()
+    sessions = recordings.loc[:, 'session'].unique()
+    tasks = recordings.loc[:, 'task'].unique()
+    labels = recordings.loc[:, 'label'].unique()
+    if any([item.shape[0] != 1
+            for item in [subjects, sessions, tasks, labels]]):
+        msg = (f'Multiple signal names found for session '
+               f'with subject {subject}, session {session}, task {task}, '
+               f'run {run} and label {label}')
+        logging.error(msg)
+        raise ValueError(msg)
+
+    # Load channels
+    data = []
+    t0 = None
+    fs = None
+    for r in recordings.itertuples():
+        d, meta = load_channel(root=root,
+                               subject=r.subject,
+                               session=r.session,
+                               task=r.task,
+                               run=r.run,
+                               label=r.label,
+                               channel=r.channel)
+        if fs is None:
+            fs = meta['fs']
+        if t0 is None:
+            t0 = meta['start_time']
+        if (fs != meta['fs']) or (t0 != meta['start_time']):
+            msg = ('Unequal sample frequencies and/or start times '
+                   'for subject {}, session {}, task {}, run {} and label {}')
+            msg.format(subject, session, task, run, label)
+            raise ValueError(msg)
+        t = pd.Index(np.arange(d.shape[0]) / fs + t0, name='time')
+        data.append(pd.Series(d, name=r.channel, index=t))
+
+    signal = pd.concat(data, axis=1)
+    signal.index.name = 'time'
+    signal.attrs['root'] = root
+    signal.attrs['fs'] = fs
+    signal.attrs['start_time'] = t0
+    signal.attrs['subject'] = subject
+    signal.attrs['session'] = session
+    signal.attrs['task'] = task
+    signal.attrs['run'] = run
+    signal.attrs['label'] = label
+    channels = signal.columns.to_list()
+    if artifact_channel is None:
+        acd = set(['iso', 'isos', 'isosbestic'])
+        artifact_channel = set(channels).intersection(acd)
+        if len(artifact_channel) == 0:
+            logging.warning(f'No artifact channel found for subject {subject}, '
+                            f'session {session}, task {task}, run {run} and '
+                            f'label {label}, using first channel {channels[0]}')
+            artifact_channel = channels[0]
+        elif len(artifact_channel) == 1:
+            artifact_channel = artifact_channel.pop()
+        else:
+            raise ValueError(
+                f'Multiple default artifact channels found for subject '
+                f'{subject}, session {session}, task {task}, run {run} and '
+                f'label {label}: {artifact_channel}')
+
+    signal.attrs['artifact_channel'] = artifact_channel
+    if exclude_artifact_channel:
+        signal.attrs['channels'] = [c for c in channels
+                                      if c != artifact_channel]
+    else:
+        signal.attrs['channels'] = channels
+
+    if len(signal.attrs['channels']) == 0:
+        raise ValueError(f'No channels found for subject {subject}, '
+                         f'session {session}, task {task}, run {run} '
+                         f'and label {label}')
+    return signal
+
+
+def load_signal(root, subject, session, task, run, label, iso_channel='iso',
+                channel=None):
+    """Load a raw signal, including the isosbestic channel if present.
+    """
+    root = Path(root).absolute()
+    if channel is None:
+        channel = '*'
+    recordings = pd.DataFrame(
+        list_raw(root, subject=subject, session=session, task=task,
+                 run=run, label=label, channel=channel))
     subjects = recordings.loc[:, 'subject'].unique()
     sessions = recordings.loc[:, 'session'].unique()
     tasks = recordings.loc[:, 'task'].unique()
@@ -135,8 +225,6 @@ def downsample(signal, factor=None):
             factor *= 2
     ds = sig.decimate(signal.to_numpy(), factor, ftype='fir',
                       zero_phase=True, axis=0)
-    ts = (np.arange(ds.shape[0]) / (signal.attrs['fs'] / factor) +
-          signal.attrs['start_time'])
     df = pd.DataFrame(ds, index=signal.index[::factor], columns=signal.columns)
     df.attrs = signal.attrs
     df.attrs['fs'] = signal.attrs['fs'] / factor
@@ -176,19 +264,23 @@ def find_discontinuities(signal, mean_window=3, std_window=30, nstd_thresh=2):
     # then use the median of a sliding window STD as our
     # characteristic STD.
     std_n = int(signal.attrs['fs'] * std_window)
-    # iso_rstds = np.std(sliding_window_view(site.iso(), std_n), axis=-1)
-    data = signal[signal.attrs['channel']].to_numpy()
-    data_rstds = bn.move_std(data, std_n, axis=-1)
-    data_thresh = np.median(data_rstds[~np.isnan(data_rstds)], axis=-1)
-    data_rmeans = bn.move_mean(np.pad(data, n, 'edge'), n, axis=-1)
-    iso = signal[signal.attrs['iso_channel']].to_numpy()
-    iso_rstds = bn.move_std(iso, std_n, axis=-1)
-    iso_thresh = np.median(iso_rstds[~np.isnan(iso_rstds)], axis=-1)
-    mean_thresh = iso_thresh * nstd_thresh
-    # Calculate a sliding mean
-    # iso_rmeans = np.mean(sliding_window_view(np.pad(site.iso(), n, 'edge'), n), axis=-1)
-    iso_rmeans = bn.move_mean(np.pad(iso, n, 'edge'), n, axis=-1)
-    d = (iso_rmeans[n:-n] - iso_rmeans[(n*2):])
+    if 'channels' not in signal.attrs:
+        logging.info('Using original single-channel format')
+        channels = [signal.attrs['channel']]
+        artifact_channel = signal.attrs['iso_channel']
+    else:
+        channels = signal.attrs['channels']
+        artifact_channel = signal.attrs['artifact_channel']
+    data = signal[channels].to_numpy()
+    data_rstds = bn.move_std(data, std_n, axis=0)
+    data_thresh = np.nanmedian(data_rstds, axis=0)
+    data_rmeans = bn.move_mean(np.pad(data, ((n, n), (0, 0)), 'edge'), n, axis=0)
+    afct = signal[artifact_channel].to_numpy()
+    afct_rstds = bn.move_std(afct, std_n, axis=0)
+    afct_thresh = np.nanmedian(afct_rstds, axis=0)
+    mean_thresh = afct_thresh * nstd_thresh
+    afct_rmeans = bn.move_mean(np.pad(afct, ((n, n)), 'edge'), n, axis=0)
+    d = (afct_rmeans[n:-n] - afct_rmeans[(n*2):])
     d_thresh = np.abs(d) > mean_thresh
     # Find the start and end of each mean shift
     mean_shift_bounds = np.diff(d_thresh.astype(int))
@@ -212,10 +304,10 @@ def find_discontinuities(signal, mean_window=3, std_window=30, nstd_thresh=2):
     onsets = np.where(mean_shift_bounds == 1)[0]
     offsets = np.where(mean_shift_bounds == -1)[0]
     for i, (onset, offset) in enumerate(zip(onsets, offsets)):
-        k = np.argmax(np.abs(data[offset:onset:-1] - data_rmeans[onset+n]) < data_thresh)
+        k = np.argmax(np.abs(data[offset:onset:-1, :] - data_rmeans[[onset+n], :]) < data_thresh)
         if k > 0:
             onsets[i] = offset - k
-        k = np.argmax(np.abs(data[onset:offset:1] - data_rmeans[offset+n]) < data_thresh)
+        k = np.argmax(np.abs(data[onset:offset:1, :] - data_rmeans[[offset+n], :]) < data_thresh)
         if k > 0:
             offsets[i] = onset + k
     return [(onset, offset)
@@ -227,20 +319,22 @@ def find_disconnects(signal, zero_nstd_thresh=5, mean_window=3, std_window=30,
                      nstd_thresh=2):
     bounds = find_discontinuities(signal, mean_window=mean_window,
                                   std_window=std_window, nstd_thresh=nstd_thresh)
-    # data = signal[signal.attrs['iso_channel']].to_numpy()
-    data = signal[signal.attrs['channel']].to_numpy()
+    if 'channels' not in signal.attrs:
+        logging.info('Using original single-channel format')
+        channels = [signal.attrs['channel']]
+    else:
+        channels = signal.attrs['channels']
+    data = signal[channels].to_numpy()
     ts = signal.index.to_numpy()
     std_n = int(signal.attrs['fs'] * std_window)
-    data_rstds = bn.move_std(data, std_n, axis=-1)
-    data_rstds = data_rstds[~np.isnan(data_rstds)]
-    zero_thresh = np.median(data_rstds, axis=-1) * zero_nstd_thresh
+    data_rstds = bn.move_std(data, std_n, axis=0)
+    zero_thresh = np.nanmedian(data_rstds, axis=0) * zero_nstd_thresh
     dc_intervals = IntervalTree()
-    bounds = [(0, 0)] + bounds + [(len(data)-1, len(data)-1)]
+    bounds = [(0, 0)] + bounds + [(data.shape[0]-1, data.shape[0]-1)]
     for (on0, off0), (on1, off1) in zip(bounds[:-1], bounds[1:]):
-        if np.mean(data[off0:on1]) < zero_thresh:
+        if np.any(np.mean(data[off0:on1, :], axis=0) < zero_thresh):
             dc_intervals.add(Interval(ts[on0], ts[off1]))
     dc_intervals.merge_overlaps()
-    # return [(b[0], b[1]) for b in list(dc_intervals)]
     return dc_intervals
 
 
@@ -272,8 +366,6 @@ def reject(signal, intervals, fill=False):
         # replace with a linear interpolation between the endpoints.
         signal = signal.copy()
         signal.loc[~mask] = np.nan
-        # for start, end in interval_list:
-        #     signal.loc[start:end] = np.nan
         signal = signal.interpolate(method='linear', limit_direction='both')
         signal['mask'] = mask
         return signal
@@ -314,8 +406,9 @@ def smooth(data, cutoff=1):
     except AttributeError:
         b = sig.firwin(1001, cutoff=[cutoff], fs=data.attrs['fs'], pass_zero=True)
         smooth.filter_b = b
-    smoothed = series_like(data, 'smoothed')
-    smoothed[:] = sig.filtfilt(b, 1, data)
+    # smoothed = series_like(data, 'smoothed')
+    smoothed = data.copy()
+    smoothed[:] = sig.filtfilt(b, 1, data.to_numpy(), axis=0).astype(np.float32)
     return smoothed
 
 
@@ -326,8 +419,9 @@ def detrend(data, numtaps=1001, cutoff=0.05):
         b = sig.firwin(numtaps, cutoff=[cutoff], fs=data.attrs['fs'],
                        pass_zero=False)
         detrend.filter_b = b
-    detrended = series_like(data, 'detrended')
-    detrended[:] = sig.filtfilt(b, 1, data)
+    # detrended = series_like(data, 'detrended')
+    detrended = data.copy()
+    detrended[:] = sig.filtfilt(b, 1, data.to_numpy(), axis=0).astype(np.float32)
     return detrended
 
 
@@ -428,19 +522,20 @@ def preprocess(root, subject, session, task, run, label):
     logging.info(f'Preprocessing subject {subject}, '
                  f'session {session}, task {task}, '
                  f'run {run}, label {label}...')
-    recording = load_signal(root, subject, session, task, run, label, 'iso')
+    recording = load_signals(root, subject, session, task, run, label, 'iso')
     recording = downsample(recording, 64)
     rej = reject(recording, intervals, fill=True)
-    ch = recording.attrs['channel']
+    ch = recording.attrs['channels']
     # We were doing a robust regression, but the fit isn't good enough.
     # Let's just detrend and divide by the smoothed signal instead.
     # dff = fp.series_like(recording, name='dff')
     # dff.loc[rej.index] = fp.detrend(rej[ch])
     dff = detrend(rej[ch], cutoff=config['detrend_cutoff'])
     dff = dff / smooth(rej[ch])
-    dff.name = 'dff'
-    dff = dff.to_frame()
+    # dff.name = 'dff'
+    # dff = dff.to_frame()
     dff['mask'] = rej['mask']
+    dff.attrs['root'] = str(dff.attrs['root'])
     data_fn = get_preprocessed_fibre_path(
         root, subject, session, task, run, label, 'parquet')
     meta_fn = get_preprocessed_fibre_path(
