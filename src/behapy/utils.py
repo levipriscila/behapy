@@ -1,3 +1,4 @@
+import logging
 from .fp import load_preprocessed_fibre
 from .events import load_events
 from .pathutils import list_preprocessed
@@ -18,7 +19,14 @@ def load_preprocessed_experiment(root):
 
     def _load_events(row):
         r = row.iloc[0]
-        return load_events(root, r.subject, r.session, r.task, r.run)
+        try:
+            events = load_events(root, r.subject, r.session, r.task, r.run)
+        except FileNotFoundError:
+            logging.warning(f'No events found for subject {r.subject}, '
+                            f'session {r.session}, task {r.task} and '
+                            f'run {r.run}')
+            events = None
+        return events
 
     id = ['subject', 'session', 'task', 'run', 'label']
     dff = recordings.groupby(id).apply(_load_preprocessed)
